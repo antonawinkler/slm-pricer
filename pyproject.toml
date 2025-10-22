@@ -1,0 +1,59 @@
+[project]
+name = "slm-pricer"
+version = "0.1.0"
+description = "Experimental Python project for fine-tuning a small language model for pricing tasks"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv",
+    "jupyterlab",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "matplotlib",
+    "torch",
+    "transformers",
+    "tqdm",
+    "datasets",
+    "plotly",
+    "jupyter-dash",
+    "accelerate",
+    "sentencepiece",
+    "bitsandbytes",
+    "peft",
+    "wandb",
+    "seaborn",
+    "trl",
+    "optuna",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]  # Line length handled by formatter
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_calls = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_optional = true
+strict_equality = true
+no_implicit_optional = true
