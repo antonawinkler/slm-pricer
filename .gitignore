@@ -78,6 +78,9 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Generated plots and visualizations
+plots/
+
 # IPython
 profile_default/
 ipython_config.py
