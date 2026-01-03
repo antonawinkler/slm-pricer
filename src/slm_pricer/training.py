@@ -16,7 +16,6 @@ from sklearn.metrics import mean_absolute_error
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 
 def evaluate_model(
@@ -91,14 +90,7 @@ def train_model(
         model.train()
         running_loss = 0.0
 
-        batch_pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{epochs}",
-            leave=False,
-            disable=not verbose,
-        )
-
-        for inputs, targets in batch_pbar:
+        for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             inputs = inputs.view(inputs.size(0), -1)
             targets = targets.view(-1, 1)
@@ -113,7 +105,6 @@ def train_model(
             scheduler.step()
 
             running_loss += loss.item()
-            batch_pbar.set_postfix({"batch_loss": f"{loss.item():.4f}"})
 
         avg_train_loss = running_loss / len(train_loader)
 

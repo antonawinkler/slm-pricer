@@ -5,18 +5,14 @@ This module contains dataset classes and functions for loading and preparing
 data for training price prediction models.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Optional, cast
+from typing import Literal, Optional, cast
 
 import numpy as np
+import pandas as pd
 import torch
 from datasets import Dataset as HFDataset
 from torch.utils.data import Dataset
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 
 class PriceDataset(Dataset):
