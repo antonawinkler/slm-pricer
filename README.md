@@ -7,7 +7,6 @@ Experimental Python project for fine-tuning a small language model for pricing t
 ```
 slm-pricer/
 ├── src/slm_pricer/              # Core package (importable)
-│   ├── __init__.py
 │   ├── models.py                # Neural network architectures
 │   ├── training.py              # Training and evaluation utilities
 │   ├── data.py                  # Dataset classes and data loading

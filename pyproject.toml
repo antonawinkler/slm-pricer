@@ -18,9 +18,13 @@ dependencies = [
     "scikit-learn",
     "matplotlib",
     "torch",
+    "torchvision",
+    "torchaudio",
     "transformers",
     "tqdm",
-    "datasets",
+    "datasets>=2.19.0",
+    "pyarrow>=12.0.0",
+    "requests",
     "plotly",
     "jupyter-dash",
     "accelerate",
@@ -38,6 +42,12 @@ dev = [
     "pytest",
     "ruff",
     "mypy",
+    "types-requests",
+    "types-tqdm",
+    "pandas-stubs",
+    "types-Pillow",
+    "types-PyYAML",
+    "types-setuptools",
 ]
 
 [tool.setuptools.packages.find]
