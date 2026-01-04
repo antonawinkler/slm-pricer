@@ -47,15 +47,24 @@ class CompressionPriceNet(nn.Module):
 class PriceRegressor(nn.Module):
     """Simple deep price regression network."""
 
-    def __init__(self, input_dim: int = 3072):
+    def __init__(
+        self,
+        input_dim: int = 3072,
+        hidden_dim1: int = 1024,
+        hidden_dim2: int = 256,
+        dropout: float = 0.1,
+    ):
         super(PriceRegressor, self).__init__()
+
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 1024),
+            nn.Linear(input_dim, hidden_dim1),
+            nn.BatchNorm1d(hidden_dim1),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(1024, 256),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim1, hidden_dim2),
+            nn.BatchNorm1d(hidden_dim2),
             nn.ReLU(),
-            nn.Linear(256, 1),
+            nn.Linear(hidden_dim2, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
