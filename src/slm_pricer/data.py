@@ -45,7 +45,7 @@ def load_embeddings(
         filepath = cache_path / f"{cache_filename_root}{split}.npy"
         if not filepath.exists():
             raise FileNotFoundError(f"Embedding file not found: {filepath}")
-        embeddings[split] = np.load(filepath)
+        embeddings[split] = np.load(filepath, mmap_mode="r")
         print(f"Loaded {split} embeddings: {embeddings[split].shape}")
 
     return embeddings
