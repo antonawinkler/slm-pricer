@@ -5,7 +5,7 @@ This module contains helper functions for price transformations,
 configuration management, and other common operations.
 """
 
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import optuna
@@ -42,6 +42,80 @@ def convert_back_y(
         return transformed_prices
     else:
         raise ValueError(f"Unknown transform_type: {transform_type}")
+
+
+def create_early_stopping_fn(
+    patience: int = 10,
+    loss_patience: int = 2,
+    loss_threshold: float = 1.1,
+    warmup_epochs: int = 10,
+) -> Callable[[int, float, float, float], tuple[bool, str]]:
+    """Create an early stopping function.
+
+    Stops training when either:
+    1. Val MAE doesn't improve for `patience` epochs.
+    2. Val loss increases significantly above minimum,
+
+    Args:
+        patience: Stop if val MAE doesn't improve for this many epochs
+        loss_patience: Stop if val loss > loss_threshold * min_val_loss for this
+            many consecutive epochs
+        loss_threshold: Loss degradation ratio threshold (e.g., 1.1 = 10% above
+            minimum)
+        warmup_epochs: Wait this many epochs before checking
+
+    Returns:
+        Function with signature (epoch, train_loss, val_loss, val_mae)
+        that returns (should_stop, reason)
+    """
+    best_val_mae = float("inf")
+    min_val_loss = float("inf")
+    epochs_without_mae_improvement = 0
+    epochs_with_loss_degradation = 0
+
+    def early_stopping_fn(
+        epoch: int, train_loss: float, val_loss: float, val_mae: float
+    ) -> tuple[bool, str]:
+        nonlocal best_val_mae, min_val_loss
+        nonlocal epochs_without_mae_improvement, epochs_with_loss_degradation
+
+        if epoch < warmup_epochs:
+            best_val_mae = min(best_val_mae, val_mae)
+            min_val_loss = min(min_val_loss, val_loss)
+            return False, ""
+
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
+            epochs_without_mae_improvement = 0
+        else:
+            epochs_without_mae_improvement += 1
+
+        if val_loss < min_val_loss:
+            min_val_loss = val_loss
+            epochs_with_loss_degradation = 0
+        elif val_loss > min_val_loss * loss_threshold:
+            epochs_with_loss_degradation += 1
+        else:
+            epochs_with_loss_degradation = 0
+
+        if epochs_without_mae_improvement >= patience:
+            return (
+                True,
+                f"Val MAE has not improved for {patience} epochs "
+                f"(best: ${best_val_mae:.2f}, current: ${val_mae:.2f})",
+            )
+
+        if epochs_with_loss_degradation >= loss_patience:
+            loss_ratio = val_loss / min_val_loss
+            return (
+                True,
+                f"Val loss degraded for {loss_patience} epochs "
+                f"(min: {min_val_loss:.4f}, current: {val_loss:.4f}, ratio: {loss_ratio:.2f}x)",
+            )
+
+        return False, ""
+
+    return early_stopping_fn
 
 
 def print_best_trials(study: optuna.Study, n: int = 5) -> None:

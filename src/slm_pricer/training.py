@@ -73,18 +73,24 @@ def train_model(
     epochs: int = 100,
     grad_clip: float = 1.0,
     trial: Optional[optuna.Trial] = None,
-    prune_on_increase: bool = True,
-    increase_threshold: float = 1.1,
+    early_stopping_fn: Optional[
+        Callable[[int, float, float, float], tuple[bool, str]]
+    ] = None,
     verbose: bool = True,
 ) -> float:
     """Train model with early stopping and return best validation MAE in dollars.
 
-    Supports Optuna pruning via trial parameter. Prunes if median pruner triggers
-    or if val MAE increases significantly after warmup (epoch 10+).
+    Supports Optuna pruning via trial parameter (median pruner only).
+    Early stopping can be configured via early_stopping_fn.
+
+    Args:
+        early_stopping_fn: Optional function(epoch, train_loss, val_loss, val_mae)
+            that returns (should_stop, reason). If returns True, training stops
+            but trial completes normally with best MAE. Warmup handling is the
+            responsibility of the function itself.
     """
     best_val_mae = float("inf")
     no_improve_count = 0
-    prev_val_mae = float("inf")
 
     for epoch in range(epochs):
         model.train()
@@ -131,6 +137,20 @@ def train_model(
         else:
             no_improve_count += 1
 
+        # Check early stopping criterion
+        if early_stopping_fn is not None:
+            should_stop, reason = early_stopping_fn(
+                epoch, avg_train_loss, val_loss, val_mae
+            )
+            if should_stop:
+                if verbose:
+                    print(
+                        f"  ⏹ Early stopping at epoch {epoch + 1}: {reason}\n"
+                        f"  Returning best Val MAE: ${best_val_mae:.2f}"
+                    )
+                break
+
+        # Optuna pruning (median pruner only)
         if trial is not None:
             trial.report(val_mae, epoch)
 
@@ -138,18 +158,6 @@ def train_model(
                 if verbose:
                     print(f"  ✂ Trial pruned at epoch {epoch + 1} (median pruner)")
                 raise optuna.TrialPruned()
-
-            if prune_on_increase and epoch >= 10:
-                if val_mae > prev_val_mae * increase_threshold:
-                    if verbose:
-                        print(
-                            f"  ✂ Trial pruned at epoch {epoch + 1}: "
-                            f"Val MAE increased from ${prev_val_mae:.2f} to ${val_mae:.2f} "
-                            f"(>{increase_threshold}x threshold)"
-                        )
-                    raise optuna.TrialPruned()
-
-        prev_val_mae = val_mae
 
     return best_val_mae
 
