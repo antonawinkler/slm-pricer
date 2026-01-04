@@ -72,6 +72,30 @@ class PriceRegressor(nn.Module):
         return result
 
 
+class ShallowPriceNet(nn.Module):
+    """Shallow price regression network with single hidden layer."""
+
+    def __init__(
+        self,
+        input_dim: int = 3072,
+        hidden_dim: int = 512,
+        dropout: float = 0.1,
+    ):
+        super(ShallowPriceNet, self).__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        result: torch.Tensor = self.net(x)
+        return result
+
+
 class ResidualBlock(nn.Module):
     """Residual block with BatchNorm and dropout."""
 
