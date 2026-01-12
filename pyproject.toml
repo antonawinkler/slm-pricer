@@ -28,6 +28,7 @@ dependencies = [
     "plotly",
     "jupyter-dash",
     "accelerate",
+    "sentence_transformers",
     "sentencepiece",
     "bitsandbytes",
     "peft",
