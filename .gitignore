@@ -77,6 +77,8 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+# we use .py notebooks, converting them to pynb if needed
+.pynb
 
 # Generated plots and visualizations
 plots/

@@ -67,7 +67,7 @@ def save_embeddings(
 
 
 def load_data_from_hf(
-    split: Literal["train", "val", "test"] = "train",
+    split: Literal["train", "val", "validation", "test"] = "train",
     percent: int = 100,
     dataset_name: str = "ed-donner/items_prompts_full",
 ) -> pd.DataFrame:
