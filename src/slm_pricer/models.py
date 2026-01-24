@@ -284,12 +284,13 @@ class ResidualBlock(nn.Module):
 class ResidualNet(nn.Module):
     def __init__(
         self,
+        input_dim: int = 3072,
         dropout: float = 0.3,
         n_layers: int = 1,
         hidden_dim: int = 5000,
     ) -> None:
         super().__init__()
-        input_dim = 3072 * n_layers
+        input_dim = input_dim * n_layers
 
         self.entry = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
