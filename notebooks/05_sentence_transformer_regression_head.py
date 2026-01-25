@@ -1,699 +1,442 @@
+# %%
+# !git clone https://github.com/antonawinkler/slm-pricer.git
+# %cd slm-pricer
+# !uv pip install .
+# %cd ..
+
 # %% [markdown]
-# # Sentence Transformer with Regression Head for Price Prediction
-#
-# ## Overview
-#
-# This notebook demonstrates using **sentence transformer models** as embedding generators combined with a **regression head** to predict prices from product descriptions.
-#
-# Building on the approach from notebook 03 (fine-tuned Llama with regression head), this notebook:
-# 1. Uses sentence transformer models (configurable) to generate embeddings
-# 2. Trains a regression head on top of those embeddings to predict prices
-# 3. Supports multiple embedding models including custom fine-tuned ones
-#
-# ## Supported Models
-#
-# - `antonawinkler/slm-pricer-llama-3.2-3b` - Custom fine-tuned Llama 3.2 3B
-# - `nvidia/llama-embed-nemotron-8b` - NVIDIA's Llama embedding model
-# - Any sentence-transformers compatible model
-#
-# ## Key Advantages
-#
-# 1. **Faster inference**: Sentence transformers are optimized for embedding generation
-# 2. **Better embeddings**: Models trained with contrastive learning for semantic similarity
-# 3. **Flexible architecture**: Can swap embedding models easily
-# 4. **Continuous predictions**: Regression head predicts any price value
-
+# ## 📦 Setup: Imports and Configuration
 
 # %%
-!git clone https://github.com/antonawinkler/slm-pricer.git
-
-%cd slm-pricer
-!uv pip install .
-%cd ..
-
-
-# %%
-import json
+import os
+import pathlib
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
-import optuna
+import sentence_transformers
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from google.colab import drive, userdata
+from datasets import Dataset, load_dataset
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    r2_score,
+)
 from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as TorchDataset
 from tqdm import tqdm
 
-from slm_pricer.data import (
-    PriceDataset,
-    load_data_from_hf,
-    load_embeddings,
-    save_embeddings,
-)
-from slm_pricer.models import PriceRegressor
-from slm_pricer.training import evaluate_model, train_model
-from slm_pricer.utils import (
-    convert_back_y,
-    create_early_stopping_fn,
-    transformed_prices,
-)
+from slm_pricer.models import ResidualNet
+from slm_pricer.utils import convert_back_y, transformed_prices
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 
 # %%
 @dataclass
 class Config:
-    """Configuration for sentence transformer with regression head."""
+    """Configuration for embedding-based price prediction."""
 
-    # Embedding model configuration
-    embedding_model_name: str = "antonawinkler/slm-pricer-llama-3.2-3b"  # or "nvidia/llama-embed-nemotron-8b"
-    embedding_batch_size: int = 64
-    max_seq_length: int = 128
-    normalize_embeddings: bool = True
+    # Data configuration
+    dataset_name: str = "ed-donner/items_prompts_full"
+    train_frac_pct: int = 50
 
-    # Data
-    data_percent: int = 100
+    # Model configuration
+    model_name: str = "antonawinkler/slm-pricer-llama-3.2-3b-embedding02"
+    embeddings_base_path: pathlib.Path = pathlib.Path(
+        "/content/drive/MyDrive/Pricer_Embeddings"
+    )
+    embedding_batch_size: int = 128
 
-    # Data preprocessing
-    y_transform: str = "log"  # Transform for target prices: "log", "unit", or None
-
-    # Embedding caching
-    use_cached_embeddings: bool = True
-    cache_path: Path = Path("/content/drive/MyDrive/Pricer_Embeddings")
-    cache_filename_root: str = "sentence_transformer_"  # Will append model name
-
-    # Optuna settings
-    run_optuna: bool = True
-    n_trials: int = 50
-    optuna_epochs: int = 50
-
-    # Final training
-    run_final_training: bool = True
-    use_best_trial_params: bool = False
-
-    # Training hyperparameters (used if not running Optuna)
-    batch_size: int = 256
+    # Training hyperparameters
+    y_transform: str = "log"
+    batch_size: int = 2048
     learning_rate: float = 1e-4
     weight_decay: float = 0.05
-    hidden_dim1: int = 1024
-    hidden_dim2: int = 256
-    dropout: float = 0.1
+    dropout: float = 0.2
     epochs: int = 100
+    patience: int = 30
     grad_clip: float = 1.0
 
     # Reproducibility
     seed: int = 42
 
+    @property
+    def model_safe_name(self) -> str:
+        """Convert model name to filesystem-safe string."""
+        return self.model_name.replace("/", "_").replace(":", "_")
+
+    @property
+    def embeddings_dir(self) -> pathlib.Path:
+        """Directory where embeddings for this model are stored."""
+        return self.embeddings_base_path / self.model_safe_name
+
 
 CONFIG = Config()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-torch.manual_seed(CONFIG.seed)
-np.random.seed(CONFIG.seed)
-
-
-# %% [markdown]
-# ## Import Data
-
 
 # %%
-df_train = load_data_from_hf(split="train", percent=CONFIG.data_percent)
-df_val = load_data_from_hf(split="val", percent=100)
-df_test = load_data_from_hf(split="test", percent=100)
+# Mount Google Drive (Colab only)
+try:
+    from google.colab import drive  # type: ignore
 
-print(
-    f"Train: {len(df_train):,} samples | Val: {len(df_val):,} samples | Test: {len(df_test):,} samples"
-)
-
-y_train = transformed_prices(
-    df_train["completion"].to_numpy(dtype="float32"), CONFIG.y_transform
-)
-y_val = transformed_prices(
-    df_val["completion"].to_numpy(dtype="float32"), CONFIG.y_transform
-)
-y_test = transformed_prices(
-    df_test["completion"].to_numpy(dtype="float32"), CONFIG.y_transform
-)
-
-print(f"Target ranges ({CONFIG.y_transform}-transformed):")
-print(f"  Train: [{y_train.min():.2f}, {y_train.max():.2f}]")
-print(f"  Val:   [{y_val.min():.2f}, {y_val.max():.2f}]")
-print(f"  Test:  [{y_test.min():.2f}, {y_test.max():.2f}]")
-
-
-# %% [markdown]
-# ## Generate Embeddings
-
-
-# %%
-if not CONFIG.use_cached_embeddings:
-    print(f"Loading sentence transformer model: {CONFIG.embedding_model_name}...")
-
-    model = SentenceTransformer(
-        CONFIG.embedding_model_name,
-        device=device,
-        trust_remote_code=True,
-    )
-
-    if hasattr(model, "max_seq_length"):
-        model.max_seq_length = CONFIG.max_seq_length
-
-    print(f"Model loaded. Embedding dimension: {model.get_sentence_embedding_dimension()}")
-else:
-    print("Using cached embeddings")
-
-
-# %%
-def get_sentence_transformer_embeddings(
-    model: SentenceTransformer,
-    texts: list[str],
-    batch_size: int = 64,
-    normalize: bool = True,
-) -> np.ndarray:
-    """Extract embeddings from sentence transformer model.
-
-    Returns array of shape (N, embedding_dim).
-    """
-    print(f"Generating embeddings (batch size: {batch_size})...")
-
-    embeddings = model.encode(
-        texts,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        normalize_embeddings=normalize,
-        convert_to_numpy=True,
-    )
-
-    return embeddings
-
-
-if not CONFIG.use_cached_embeddings:
-    embeddings = {}
-    for split, df in [("train", df_train), ("val", df_val), ("test", df_test)]:
-        print(f"\nProcessing {split} split...")
-        embeddings[split] = get_sentence_transformer_embeddings(
-            model,
-            df["prompt"].tolist(),
-            batch_size=CONFIG.embedding_batch_size,
-            normalize=CONFIG.normalize_embeddings,
-        )
-        print(f"Shape: {embeddings[split].shape}")
-
-    X_train = embeddings["train"]
-    X_val = embeddings["val"]
-    X_test = embeddings["test"]
-else:
-    print("Using cached embeddings")
-
-
-# %% [markdown]
-# ## Save Embeddings to Google Drive
-
-
-# %%
-if not CONFIG.use_cached_embeddings:
     drive.mount("/content/drive")
-
-    # Create model-specific cache filename
-    model_short_name = CONFIG.embedding_model_name.replace("/", "_").replace("-", "_")
-    cache_filename = f"{CONFIG.cache_filename_root}{model_short_name}_"
-
-    print(f"Saving embeddings to {CONFIG.cache_path}...")
-    save_embeddings(
-        embeddings={"train": X_train, "val": X_val, "test": X_test},
-        cache_path=CONFIG.cache_path,
-        cache_filename_root=cache_filename,
-    )
-else:
-    print("Using cached embeddings")
-
-
-# %% [markdown]
-# ## Load Cached Embeddings
+except ImportError:
+    pass
 
 
 # %%
-if CONFIG.use_cached_embeddings:
-    drive.mount("/content/drive")
-
-    model_short_name = CONFIG.embedding_model_name.replace("/", "_").replace("-", "_")
-    cache_filename = f"{CONFIG.cache_filename_root}{model_short_name}_"
-
-    print(f"Loading cached embeddings from {CONFIG.cache_path}...")
-
-    embeddings = load_embeddings(
-        cache_path=CONFIG.cache_path,
-        cache_filename_root=cache_filename,
-        splits=["train", "val", "test"],
-    )
-
-    X_train = embeddings["train"][: len(df_train)]
-    X_val = embeddings["val"]
-    X_test = embeddings["test"]
-
-    print(f"Train: {X_train.shape} | Val: {X_val.shape} | Test: {X_test.shape}")
-else:
-    print("Using generated embeddings")
-
-
-# %% [markdown]
-# ## Optuna Hyperparameter Optimization
+def load_data(split: str = "train", percent: int = 100) -> Dataset:
+    """Load dataset split from HuggingFace."""
+    dataset = load_dataset(CONFIG.dataset_name, split=f"{split}[:{percent}%]")
+    assert isinstance(dataset, Dataset)
+    return dataset
 
 
 # %%
-def objective(trial: optuna.Trial) -> float:
-    """Optuna objective optimizing regression head architecture and hyperparameters.
+class PriceDataset(TorchDataset):
+    """PyTorch dataset for price regression."""
 
-    Returns best validation MAE in dollars (lower is better).
-    """
-    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-    hidden_dim1 = trial.suggest_int("hidden_dim1", 512, 2048, step=256)
-    hidden_dim2 = trial.suggest_int("hidden_dim2", 128, 512, step=128)
-    dropout = trial.suggest_float("dropout", 0.05, 0.3)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)
-    batch_size = trial.suggest_int("batch_size", 128, 512, step=128)
+    def __init__(self, x: np.ndarray, y: np.ndarray):
+        self.X = torch.tensor(x, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
 
-    print(f"\n{'=' * 80}")
-    print(f"Trial {trial.number}: Testing hyperparameters:")
-    print(f"  Learning Rate: {learning_rate:.2e}")
-    print(f"  Hidden Dim 1: {hidden_dim1}")
-    print(f"  Hidden Dim 2: {hidden_dim2}")
-    print(f"  Dropout: {dropout:.3f}")
-    print(f"  Weight Decay: {weight_decay:.2e}")
-    print(f"  Batch Size: {batch_size}")
-    print(f"{'=' * 80}\n")
+    def __len__(self) -> int:
+        return len(self.X)
 
-    input_dim = X_train.shape[1]
-
-    model = PriceRegressor(
-        input_dim=input_dim,
-        hidden_dim1=hidden_dim1,
-        hidden_dim2=hidden_dim2,
-        dropout=dropout,
-    ).to(device)
-
-    train_loader = DataLoader(
-        PriceDataset(X_train, y_train),
-        batch_size=batch_size,
-        shuffle=True,
-    )
-    val_loader = DataLoader(
-        PriceDataset(X_val, y_val),
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=learning_rate,
-        epochs=CONFIG.optuna_epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1,
-        anneal_strategy="cos",
-    )
-
-    early_stop_fn = create_early_stopping_fn(
-        patience=10,
-        loss_patience=3,
-        loss_threshold=1.5,
-        warmup_epochs=10,
-    )
-
-    best_val_mae = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        convert_back_fn=convert_back_y,
-        epochs=CONFIG.optuna_epochs,
-        grad_clip=CONFIG.grad_clip,
-        trial=trial,
-        early_stopping_fn=early_stop_fn,
-        verbose=False,
-    )
-
-    print(f"\nTrial {trial.number} completed: Val MAE = ${best_val_mae:.2f}\n")
-
-    return best_val_mae
-
-
-if CONFIG.run_optuna:
-    print(f"\n{'=' * 80}")
-    print(f"Starting Optuna optimization with {CONFIG.n_trials} trials...")
-    print(f"{'=' * 80}\n")
-
-    study = optuna.create_study(
-        direction="minimize",
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=5,
-            n_warmup_steps=10,
-        ),
-        study_name="sentence_transformer_regression_head_optimization",
-    )
-
-    study.optimize(objective, n_trials=CONFIG.n_trials, show_progress_bar=True)
-
-    print(f"\n{'=' * 80}")
-    print("Optimization completed!")
-    print(f"{'=' * 80}\n")
-else:
-    study = None
-
-
-# %% [markdown]
-# ## Optuna Results Analysis
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.X[idx], self.y[idx]
 
 
 # %%
-if CONFIG.run_optuna and study is not None:
+def evaluate_comprehensive(
+    model: nn.Module, data_loader: DataLoader, criterion: nn.Module
+) -> dict[str, float]:
+    """Evaluate model and return comprehensive metrics in dollars."""
+    model.eval()
+    total_loss = 0.0
+    all_preds: list[float] = []
+    all_targets: list[float] = []
+
+    with torch.no_grad():
+        for inputs, targets in data_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = inputs.view(inputs.size(0), -1)
+            targets = targets.view(-1, 1)
+
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            total_loss += loss.item()
+
+            all_preds.extend(outputs.cpu().numpy().flatten().tolist())
+            all_targets.extend(targets.cpu().numpy().flatten().tolist())
+
+    avg_loss = total_loss / len(data_loader)
+
+    real_preds_transformed = np.array(all_preds)
+    real_targets_transformed = np.array(all_targets)
+
+    # Clip to prevent overflow on inverse transform (max ~$3M)
+    real_preds_transformed = np.clip(real_preds_transformed, 0, 15)
+
+    real_preds = convert_back_y(real_preds_transformed, CONFIG.y_transform)
+    real_targets = convert_back_y(real_targets_transformed, CONFIG.y_transform)
+
+    mae = mean_absolute_error(real_targets, real_preds)
+    mape = mean_absolute_percentage_error(real_targets, real_preds)
+    r2 = r2_score(real_targets, real_preds)
+
+    errors = np.abs(real_targets - real_preds)
+    median_error = float(np.median(errors))
+    p90_error = float(np.percentile(errors, 90))
+
+    return {
+        "loss": avg_loss,
+        "mae": mae,
+        "mape": mape,
+        "r2": r2,
+        "median_error": median_error,
+        "p90_error": p90_error,
+    }
+
+
+# %%
+def training_loop(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.LRScheduler,
+) -> None:
+    """Train model with early stopping and evaluate on test set."""
     print("\n" + "=" * 80)
-    print("TOP 5 TRIALS")
-    print("=" * 80)
-
-    top_trials = sorted(
-        study.trials, key=lambda t: t.value if t.value is not None else float("inf")
-    )[:5]
-
-    for rank, trial in enumerate(top_trials, 1):
-        print(f"\n{'─' * 80}")
-        print(f"Rank {rank}: Trial #{trial.number}")
-        print(f"{'─' * 80}")
-        print(f"Validation MAE: ${trial.value:.2f}")
-        print("\nHyperparameters:")
-
-        params = trial.params
-        lr = params["learning_rate"]
-        wd = params["weight_decay"]
-        dropout = params["dropout"]
-        hidden_dim1 = params["hidden_dim1"]
-        hidden_dim2 = params["hidden_dim2"]
-        bs = params["batch_size"]
-
-        print(f"  learning_rate:  {lr:.2e}")
-        print(f"  weight_decay:   {wd:.2e}")
-        print(f"  dropout:        {dropout:.3f}")
-        print(f"  hidden_dim1:    {hidden_dim1}")
-        print(f"  hidden_dim2:    {hidden_dim2}")
-        print(f"  batch_size:     {bs}")
-
-    print("\n" + "=" * 80)
-    print(
-        f"\nBest Trial: #{study.best_trial.number} with Val MAE: ${study.best_value:.2f}"
-    )
-    print("=" * 80)
-
-    print("\n" + "=" * 80)
-    print("PARAMETER IMPORTANCE")
+    print("TRAINING STARTED")
     print("=" * 80 + "\n")
 
-    importance = optuna.importance.get_param_importances(study)
-    for param, imp in importance.items():
-        print(f"  {param}: {imp:.4f}")
+    history: dict[str, list[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_mae": [],
+        "val_mape": [],
+        "val_r2": [],
+        "learning_rate": [],
+    }
 
+    best_val_mae = float("inf")
+    no_improve_count = 0
 
-# %% [markdown]
-# ## Train Final Model
+    epoch_pbar = tqdm(range(CONFIG.epochs), desc="Training", unit="epoch", position=0)
+
+    for epoch in epoch_pbar:
+        model.train()
+        running_loss = 0.0
+
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = inputs.view(inputs.size(0), -1)
+            targets = targets.view(-1, 1)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG.grad_clip)
+
+            optimizer.step()
+            scheduler.step()
+
+            running_loss += loss.item()
+
+        avg_train_loss = running_loss / len(train_loader)
+        val_metrics = evaluate_comprehensive(model, val_loader, criterion)
+
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(val_metrics["loss"])
+        history["val_mae"].append(val_metrics["mae"])
+        history["val_mape"].append(val_metrics["mape"])
+        history["val_r2"].append(val_metrics["r2"])
+        history["learning_rate"].append(optimizer.param_groups[0]["lr"])
+
+        epoch_pbar.set_postfix(
+            {
+                "MAE": f"${val_metrics['mae']:.2f}",
+                "R²": f"{val_metrics['r2']:.3f}",
+                "MAPE": f"{val_metrics['mape'] * 100:.2f}",
+                "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
+                "train_loss": f"{avg_train_loss:.4f}",
+                "val_loss": f"{val_metrics['loss']:.4f}",
+            }
+        )
+
+        if val_metrics["mae"] < best_val_mae:
+            best_val_mae = val_metrics["mae"]
+            no_improve_count = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "mae": best_val_mae,
+                    "config": CONFIG,
+                },
+                os.path.join(CONFIG.embeddings_base_path, "best_model.pth"),
+            )
+            print(f"  ✓ New best MAE: ${best_val_mae:.2f}")
+        else:
+            no_improve_count += 1
+            if no_improve_count >= CONFIG.patience:
+                print(
+                    f"\n⚠️  Early stopping! No improvement for {CONFIG.patience} epochs."
+                )
+                break
+
+    print("\n" + "=" * 80)
+    print("FINAL TEST EVALUATION")
+    print("=" * 80 + "\n")
+
+    checkpoint = torch.load(
+        os.path.join(CONFIG.embeddings_base_path, "best_model.pth"), weights_only=False
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    test_metrics = evaluate_comprehensive(model, test_loader, criterion)
+
+    print("\n📊 Final Test Metrics:")
+    print(f"  MAE:          ${test_metrics['mae']:.2f}")
+    print(f"  MAPE:         {test_metrics['mape'] * 100:.2f}%")
+    print(f"  R²:           {test_metrics['r2']:.4f}")
 
 
 # %%
-print("\n" + "=" * 80)
-print("TRAINING FINAL MODEL")
-print("=" * 80 + "\n")
+print("Loading datasets...")
+ds_train = load_data(split="train", percent=CONFIG.train_frac_pct)
+ds_test = load_data(split="test", percent=100)
+ds_val = load_data(split="val", percent=100)
 
-if CONFIG.run_optuna and CONFIG.use_best_trial_params and study is not None:
-    print("Using best trial hyperparameters from Optuna\n")
-    best_params = study.best_params
-    learning_rate = best_params["learning_rate"]
-    hidden_dim1 = best_params["hidden_dim1"]
-    hidden_dim2 = best_params["hidden_dim2"]
-    dropout = best_params["dropout"]
-    weight_decay = best_params["weight_decay"]
-    batch_size = best_params["batch_size"]
-else:
-    print("Using manual configuration hyperparameters\n")
-    learning_rate = CONFIG.learning_rate
-    hidden_dim1 = CONFIG.hidden_dim1
-    hidden_dim2 = CONFIG.hidden_dim2
-    dropout = CONFIG.dropout
-    weight_decay = CONFIG.weight_decay
-    batch_size = CONFIG.batch_size
+print(f"Train set: {len(ds_train):,} samples")
+print(f"Test set: {len(ds_test):,} samples")
+print(f"Validation set: {len(ds_val):,} samples")
 
-print("Hyperparameters:")
-print(f"  Learning Rate: {learning_rate:.2e}")
-print(f"  Hidden Dim 1: {hidden_dim1}")
-print(f"  Hidden Dim 2: {hidden_dim2}")
-print(f"  Dropout: {dropout:.3f}")
-print(f"  Weight Decay: {weight_decay:.2e}")
-print(f"  Batch Size: {batch_size}")
-print()
 
-input_dim = X_train.shape[1]
+# %%
+def clean_prompt(text: str) -> str:
+    """Remove prompt template text, leaving only product description."""
+    return text.replace("What does this cost to the nearest dollar?\n\n", "").replace(
+        "\n\nPrice is $", ""
+    )
 
-final_model = PriceRegressor(
-    input_dim=input_dim,
-    hidden_dim1=hidden_dim1,
-    hidden_dim2=hidden_dim2,
-    dropout=dropout,
-).to(device)
 
+def get_embedding_path(split: str) -> pathlib.Path:
+    """Get path for cached embeddings for a given split."""
+    return CONFIG.embeddings_dir / f"{split}.npy"
+
+
+def load_or_create_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load embeddings from cache or generate them if they don't exist.
+
+    Returns:
+        Tuple of (X_train, X_test, X_val) embeddings
+
+    Embeddings are automatically cached to disk for reuse. The cache key is based
+    on the model name, so switching models will regenerate embeddings.
+    """
+    train_path = get_embedding_path("train")
+    test_path = get_embedding_path("test")
+    val_path = get_embedding_path("val")
+
+    # Check if all embedding files exist
+    if train_path.exists() and test_path.exists() and val_path.exists():
+        print(f"Loading cached embeddings from {CONFIG.embeddings_dir}")
+        X_train = np.load(train_path)
+        X_test = np.load(test_path)
+        X_val = np.load(val_path)
+    else:
+        print(
+            f"Cached embeddings not found. Generating embeddings using {CONFIG.model_name}..."
+        )
+
+        # Create embeddings directory if it doesn't exist
+        CONFIG.embeddings_dir.mkdir(parents=True, exist_ok=True)
+
+        word_embedding_model = sentence_transformers.models.Transformer(
+            CONFIG.model_name,
+            max_seq_length=4096,
+            model_args={
+                "torch_dtype": torch.bfloat16,
+                "attn_implementation": "flash_attention_2",
+            },
+        )
+
+        pooling_model = sentence_transformers.models.Pooling(
+            word_embedding_model.get_word_embedding_dimension(),
+            pooling_mode_mean_tokens=False,
+            pooling_mode_lasttoken=True,
+        )
+
+        embedder = SentenceTransformer(
+            modules=[word_embedding_model, pooling_model], device="cuda"
+        )
+        embedder.tokenizer.pad_token = embedder.tokenizer.eos_token
+
+        # Generate embeddings for each split
+        X_train = embedder.encode(
+            [clean_prompt(p) for p in ds_train["prompt"]],
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            batch_size=CONFIG.embedding_batch_size,
+        )
+
+        X_test = embedder.encode(
+            [clean_prompt(p) for p in ds_test["prompt"]],
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            batch_size=CONFIG.embedding_batch_size,
+        )
+
+        X_val = embedder.encode(
+            [clean_prompt(p) for p in ds_val["prompt"]],
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            batch_size=CONFIG.embedding_batch_size,
+        )
+
+        # Save to cache
+        print(f"Saving embeddings to {CONFIG.embeddings_dir}")
+        np.save(train_path, X_train)
+        np.save(test_path, X_test)
+        np.save(val_path, X_val)
+
+    # Truncate train embeddings to match dataset size
+    X_train = X_train[: len(ds_train)]
+
+    print("\nEmbeddings shape:")
+    print(f"  X_train: {X_train.shape}")
+    print(f"  X_test: {X_test.shape}")
+    print(f"  X_val: {X_val.shape}")
+
+    return X_train, X_test, X_val
+
+
+# %%
+X_train, X_test, X_val = load_or_create_embeddings()
+
+
+# %%
+y_train = transformed_prices(
+    np.array(ds_train["completion"], dtype="float32"), CONFIG.y_transform
+)
+y_test = transformed_prices(
+    np.array(ds_test["completion"], dtype="float32"), CONFIG.y_transform
+)
+y_val = transformed_prices(
+    np.array(ds_val["completion"], dtype="float32"), CONFIG.y_transform
+)
+
+print("Targets shape:")
+print(f"  y_train: {y_train.shape}")
+print(f"  y_test: {y_test.shape}")
+print(f"  y_val: {y_val.shape}")
+
+
+# %%
+model = ResidualNet().to(device)
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Model initialized with {total_params:,} parameters")
+
+
+# %%
 train_loader = DataLoader(
-    PriceDataset(X_train, y_train),
-    batch_size=batch_size,
-    shuffle=True,
+    PriceDataset(X_train, y_train), batch_size=CONFIG.batch_size, shuffle=True
 )
 val_loader = DataLoader(
-    PriceDataset(X_val, y_val),
-    batch_size=batch_size,
-    shuffle=False,
+    PriceDataset(X_val, y_val), batch_size=CONFIG.batch_size, shuffle=False
 )
 test_loader = DataLoader(
-    PriceDataset(X_test, y_test),
-    batch_size=batch_size,
-    shuffle=False,
+    PriceDataset(X_test, y_test), batch_size=CONFIG.batch_size, shuffle=False
 )
 
 criterion = nn.MSELoss()
 optimizer = optim.AdamW(
-    final_model.parameters(),
-    lr=learning_rate,
-    weight_decay=weight_decay,
+    model.parameters(), lr=CONFIG.learning_rate, weight_decay=CONFIG.weight_decay
 )
 scheduler = optim.lr_scheduler.OneCycleLR(
     optimizer,
-    max_lr=learning_rate,
+    max_lr=CONFIG.learning_rate,
     epochs=CONFIG.epochs,
     steps_per_epoch=len(train_loader),
     pct_start=0.1,
     anneal_strategy="cos",
 )
 
-early_stop_fn = create_early_stopping_fn(
-    patience=15,
-    loss_patience=3,
-    loss_threshold=1.5,
-    warmup_epochs=10,
-)
-
-best_val_mae = train_model(
-    model=final_model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    criterion=criterion,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    device=device,
-    convert_back_fn=convert_back_y,
-    epochs=CONFIG.epochs,
-    grad_clip=CONFIG.grad_clip,
-    trial=None,
-    early_stopping_fn=early_stop_fn,
-    verbose=True,
-)
-
-print(f"\nFinal model Val MAE: ${best_val_mae:.2f}")
-
-
-# %% [markdown]
-# ## Test Evaluation
-
 
 # %%
-print("\n" + "=" * 80)
-print("FINAL TEST EVALUATION")
-print("=" * 80 + "\n")
-
-test_metrics = evaluate_model(
-    final_model, test_loader, criterion, device, convert_back_y
+training_loop(
+    model, train_loader, val_loader, test_loader, criterion, optimizer, scheduler
 )
-
-print(f"Test Loss: {test_metrics['loss']:.4f}")
-print(f"Test MAE: ${test_metrics['mae']:.2f}")
-
-print("\n" + "=" * 80)
-
-
-# %% [markdown]
-# ## Save Results and Model
-
-
-# %%
-results = {
-    "timestamp": datetime.now().isoformat(),
-    "test_mae": test_metrics["mae"],
-    "test_loss": test_metrics["loss"],
-    "val_mae": best_val_mae,
-    "config": {
-        "embedding_model_name": CONFIG.embedding_model_name,
-        "max_seq_length": CONFIG.max_seq_length,
-        "normalize_embeddings": CONFIG.normalize_embeddings,
-        "data_percent": CONFIG.data_percent,
-        "y_transform": CONFIG.y_transform,
-        "epochs": CONFIG.epochs,
-        "seed": CONFIG.seed,
-    },
-    "hyperparameters": {
-        "learning_rate": learning_rate,
-        "hidden_dim1": hidden_dim1,
-        "hidden_dim2": hidden_dim2,
-        "dropout": dropout,
-        "weight_decay": weight_decay,
-        "batch_size": batch_size,
-    },
-}
-
-if CONFIG.run_optuna and study is not None:
-    results["optuna"] = {
-        "n_trials": len(study.trials),
-        "best_trial_number": study.best_trial.number,
-        "best_val_mae": study.best_value,
-    }
-
-model_short_name = CONFIG.embedding_model_name.replace("/", "_").replace("-", "_")
-results_path = CONFIG.cache_path / f"sentence_transformer_{model_short_name}_results.json"
-
-with open(results_path, "w") as f:
-    json.dump(results, f, indent=2)
-
-print(f"Results saved to {results_path}")
-
-model_path = CONFIG.cache_path / f"sentence_transformer_{model_short_name}_model.pth"
-checkpoint = {
-    "model_state_dict": final_model.state_dict(),
-    "model_config": {
-        "input_dim": input_dim,
-        "hidden_dim1": hidden_dim1,
-        "hidden_dim2": hidden_dim2,
-        "dropout": dropout,
-    },
-    "training_config": {
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "batch_size": batch_size,
-        "epochs": CONFIG.epochs,
-        "grad_clip": CONFIG.grad_clip,
-    },
-    "metrics": {
-        "val_mae": best_val_mae,
-        "test_mae": test_metrics["mae"],
-        "test_loss": test_metrics["loss"],
-    },
-    "embedding_config": {
-        "embedding_model_name": CONFIG.embedding_model_name,
-        "max_seq_length": CONFIG.max_seq_length,
-        "normalize_embeddings": CONFIG.normalize_embeddings,
-    },
-    "data_config": {
-        "data_percent": CONFIG.data_percent,
-        "y_transform": CONFIG.y_transform,
-    },
-    "seed": CONFIG.seed,
-    "timestamp": datetime.now().isoformat(),
-}
-
-torch.save(checkpoint, model_path)
-print(f"Model saved to {model_path}")
-
-
-# %% [markdown]
-# ## Test Predictions
-#
-# Generate predictions on example products to verify the model works correctly.
-
-
-# %%
-def predict_price(
-    description: str,
-    embedding_model: SentenceTransformer,
-    regression_model: nn.Module,
-    normalize: bool = True,
-) -> float:
-    """Predict price from product description.
-
-    Returns predicted price in dollars.
-    """
-    embedding = embedding_model.encode(
-        [description],
-        normalize_embeddings=normalize,
-        convert_to_numpy=False,
-    )
-
-    with torch.no_grad():
-        embedding = embedding.to(device)
-        log_price = regression_model(embedding).item()
-        price = np.exp(log_price)
-
-    return price
-
-
-# Load model for predictions if using cached embeddings
-if CONFIG.use_cached_embeddings:
-    print(f"Loading sentence transformer model for predictions: {CONFIG.embedding_model_name}...")
-    model = SentenceTransformer(
-        CONFIG.embedding_model_name,
-        device=device,
-        trust_remote_code=True,
-    )
-    if hasattr(model, "max_seq_length"):
-        model.max_seq_length = CONFIG.max_seq_length
-
-test_products = [
-    "Apple AirPods Pro (2nd Generation) with MagSafe Charging Case",
-    "Sony WH-1000XM5 Wireless Noise Cancelling Headphones",
-    "USB-C Cable 6ft Fast Charging Cord",
-    "Samsung Galaxy S24 Ultra 256GB Smartphone",
-    "Paper Mate Ballpoint Pens, Medium Point, Black, 12 Pack",
-]
-
-print("\n" + "=" * 80)
-print("SAMPLE PREDICTIONS")
-print("=" * 80 + "\n")
-
-print(f"{'Product Description':<60} {'Predicted Price':>15}")
-print("=" * 80)
-
-for product in test_products:
-    predicted_price = predict_price(
-        product,
-        model,
-        final_model,
-        normalize=CONFIG.normalize_embeddings,
-    )
-    display_desc = product[:57] + "..." if len(product) > 60 else product
-    print(f"{display_desc:<60} ${predicted_price:>14,.2f}")
-
-print("\n" + "=" * 80)
