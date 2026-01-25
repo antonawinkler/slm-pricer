@@ -4,12 +4,40 @@
 # This script trains a Llama model with QLoRA and a regression head jointly.
 # The last token embedding from Llama is fed into a ResNet regression head
 # to predict prices directly from product descriptions.
+#
+# ⚠️ PERFORMANCE NOTE:
+# This notebook does end-to-end training with QLoRA + regression head, which
+# recomputes embeddings on every forward pass. This is SLOW (~3 hours/epoch).
+#
+# For FASTER regression head training (~30min embeddings + 30s/epoch):
+# 1. Use 05_sentence_transformer_regression_head.py to:
+#    - Pre-compute embeddings once (30 min for Llama 3.2-3B)
+#    - Train regression head in full precision (20-60s/epoch)
+#    - Optimize for 100+ epochs with early stopping
+# 2. Then optionally use this notebook for fine-tuning LoRA (2-3 epochs)
+#
+# Use this notebook when:
+# - You want to jointly optimize LoRA and regression head
+# - You need to train on changing/streaming data
+# - You're experimenting with different LoRA configurations
+#
+# Use 05_sentence_transformer_regression_head.py when:
+# - You want to quickly iterate on regression head architecture
+# - You have a fixed dataset and pre-trained embedding model
+# - Training speed is critical (100x faster per epoch)
+
 
 # %%
 # !git clone https://github.com/antonawinkler/slm-pricer.git
 # %cd slm-pricer
 # !uv pip install .
 # %cd ..
+
+
+# %%
+# !uv pip install sentence-transformers wandb
+# !uv pip install flash-attn --no-build-isolation
+
 
 # %%
 from __future__ import annotations
@@ -18,7 +46,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from typing import Callable
+from typing import Callable, cast
 
 import numpy as np
 import torch
@@ -33,6 +61,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from slm_pricer.data import load_data_from_hf
 from slm_pricer.models import ResidualNet
+from slm_pricer.training import check_early_stopping
 from slm_pricer.utils import convert_back_y, transformed_prices
 
 # %%
@@ -46,7 +75,7 @@ class Config:
     """Configuration for end-to-end Llama + regression head training."""
 
     # Model
-    base_model: str = "meta-llama/Llama-3.2-3B"
+    base_model: str = "meta-llama/Llama-3.2-1B"
     max_seq_length: int = 128
 
     # Quantization
@@ -57,6 +86,7 @@ class Config:
     lora_r: int = 32
     lora_alpha: int = 64  # 2 * lora_r
     lora_dropout: float = 0.1
+    # TODO: or all linear?
     lora_target_modules: tuple[str, ...] = (
         "q_proj",
         "k_proj",
@@ -64,24 +94,37 @@ class Config:
         "o_proj",
     )
 
-    # Regression head (ResidualNet) - uses default parameters
-    # ResidualNet has hardcoded input_dim=3072 (matches Llama 3.2 3B hidden size)
+    # Regression head (ResidualNet)
+    # hidden_dim: None means use default (5000), set lower for smaller models
+    regression_hidden_dim: int | None = 1500
 
     # Training
     epochs: int = 3
-    batch_size: int = 32
+    batch_size: int = 128
     learning_rate: float = 1e-4
     weight_decay: float = 0.001
     warmup_ratio: float = 0.03
     max_grad_norm: float = 0.3
     gradient_accumulation_steps: int = 1
 
-    # Warmup phase: train only regression head with frozen LoRA
-    warmup_epochs: int = 1
-    warmup_learning_rate: float = 1e-3  # Higher LR for head-only training
+    # Phase 1: Warmup - train only regression head with frozen LoRA
+    warmup_epochs: int = 10
+    warmup_learning_rate: float = 1e-4
+    warmup_patience: int = 5
+
+    # Phase 3: Cooldown - fine-tune regression head after joint training
+    cooldown_epochs: int = 20
+    cooldown_learning_rate: float = 5e-5  # 50% of warmup LR
+    cooldown_patience: int = 10
 
     # Data
-    dataset_name: str = "ed-donner/items_prompts_full"
+    # Multiple dataset variations - val/test from first, train cycles through all
+    dataset_names: tuple[str, ...] = (
+        "ed-donner/items_prompts_full",
+        # Add more dataset variations here
+        # "ed-donner/items_prompts_full_v2",
+        # "ed-donner/items_prompts_full_v3",
+    )
     data_percent: int = 100
     y_transform: str = "log"
 
@@ -102,6 +145,7 @@ class Config:
 
 CONFIG = Config()
 
+
 # %%
 # =============================================================================
 # SETUP
@@ -117,6 +161,7 @@ use_bf16 = capability[0] >= 8
 print(f"Device: {device}")
 print(f"Using bf16: {use_bf16}")
 
+
 # %%
 # Login to HuggingFace and Weights & Biases
 
@@ -128,6 +173,10 @@ if CONFIG.log_to_wandb:
     os.environ["WANDB_API_KEY"] = wandb_api_key
     wandb.login()
     os.environ["WANDB_PROJECT"] = CONFIG.project_name
+    os.environ["WANDB_LOG_MODEL"] = "checkpoint"
+    # os.environ["WANDB_WATCH"] = "gradients"  # Disabled to prevent RAM accumulation
+    os.environ["WANDB_LOG_MODEL"] = "false"
+    os.environ["WANDB_WATCH"] = "false"
 
 
 # %%
@@ -158,7 +207,7 @@ class TextPriceDataset(Dataset):
         text = self.texts[idx]
         price = self.prices[idx]
 
-        encoding = self.tokenizer(
+        encoding = self.tokenizer(  # type: ignore[operator]
             text,
             max_length=self.max_length,
             padding="max_length",
@@ -186,10 +235,18 @@ class LlamaWithRegressionHead(nn.Module):
     a ResidualNet regression head.
     """
 
-    def __init__(self, llama_model: nn.Module) -> None:
+    def __init__(
+        self,
+        llama_model: nn.Module,
+        embedding_dim: int,
+        hidden_dim: int | None = None,
+    ) -> None:
         super().__init__()
         self.llama = llama_model
-        self.regression_head = ResidualNet()
+        kwargs: dict = {"input_dim": embedding_dim}
+        if hidden_dim is not None:
+            kwargs["hidden_dim"] = hidden_dim
+        self.regression_head = ResidualNet(**kwargs)
 
     def forward(
         self,
@@ -311,8 +368,9 @@ def evaluate(
             loss = criterion(predictions.squeeze(), prices.to(predictions.dtype))
 
             total_loss += loss.item()
-            all_preds.extend(predictions.squeeze().cpu().numpy())
-            all_targets.extend(prices.cpu().numpy())
+            # Cast to float32 before converting to numpy to avoid BFloat16 error
+            all_preds.extend(predictions.squeeze().float().cpu().numpy())
+            all_targets.extend(prices.float().cpu().numpy())
 
     # Convert back to dollars
     preds_dollars = convert_back_fn(np.array(all_preds))
@@ -330,21 +388,32 @@ def evaluate(
 # LOAD DATA
 # =============================================================================
 
-df_train = load_data_from_hf(
-    split="train", percent=CONFIG.data_percent, dataset_name=CONFIG.dataset_name
-)
-df_val = load_data_from_hf(split="val", percent=100, dataset_name=CONFIG.dataset_name)
-df_test = load_data_from_hf(split="test", percent=100, dataset_name=CONFIG.dataset_name)
+# Load all training dataset variations
+print(f"Loading {len(CONFIG.dataset_names)} dataset variations...")
+train_datasets = []
+for i, dataset_name in enumerate(CONFIG.dataset_names):
+    df_train = load_data_from_hf(
+        split="train", percent=CONFIG.data_percent, dataset_name=dataset_name
+    )
+    train_datasets.append(df_train)
+    print(f"  [{i+1}] {dataset_name}: {len(df_train):,} samples")
+
+# Val and test always from the first dataset
+print(f"\nLoading val/test from: {CONFIG.dataset_names[0]}")
+df_val = load_data_from_hf(split="val", percent=100, dataset_name=CONFIG.dataset_names[0])
+df_test = load_data_from_hf(split="test", percent=100, dataset_name=CONFIG.dataset_names[0])
 
 # Limit validation size for faster evaluation during training
 df_val = df_val.head(CONFIG.val_size)
 
-print(f"Train: {len(df_train):,} | Val: {len(df_val):,} | Test: {len(df_test):,}")
+print(f"\nVal: {len(df_val):,} | Test: {len(df_test):,}")
 
-# Transform prices
-y_train = transformed_prices(
-    df_train["completion"].to_numpy(dtype="float32"), CONFIG.y_transform
-)
+# Transform prices for all training datasets
+y_train_all = [
+    transformed_prices(df["completion"].to_numpy(dtype="float32"), CONFIG.y_transform)
+    for df in train_datasets
+]
+
 y_val = transformed_prices(
     df_val["completion"].to_numpy(dtype="float32"), CONFIG.y_transform
 )
@@ -352,7 +421,8 @@ y_test = transformed_prices(
     df_test["completion"].to_numpy(dtype="float32"), CONFIG.y_transform
 )
 
-print(f"Price range (log-transformed): [{y_train.min():.2f}, {y_train.max():.2f}]")
+print(f"Price range (log-transformed): [{y_train_all[0].min():.2f}, {y_train_all[0].max():.2f}]")
+
 
 # %%
 # =============================================================================
@@ -388,6 +458,7 @@ base_model.config.pad_token_id = tokenizer.pad_token_id
 
 print(f"Memory footprint: {base_model.get_memory_footprint() / 1e6:.1f} MB")
 
+
 # %%
 # =============================================================================
 # APPLY LORA
@@ -405,15 +476,20 @@ lora_config = LoraConfig(
 base_model = get_peft_model(base_model, lora_config)
 base_model.print_trainable_parameters()
 
+
 # %%
 # =============================================================================
 # CREATE COMBINED MODEL
 # =============================================================================
 
-embedding_dim = base_model.config.hidden_size
+embedding_dim = cast(int, getattr(base_model.config, "hidden_size"))
 print(f"Llama embedding dimension: {embedding_dim}")
 
-model = LlamaWithRegressionHead(llama_model=base_model)
+model = LlamaWithRegressionHead(
+    llama_model=base_model,
+    embedding_dim=embedding_dim,
+    hidden_dim=CONFIG.regression_hidden_dim,
+)
 
 # Move regression head to the same device and dtype as Llama
 # (Llama is on CUDA via device_map="auto" with bf16/fp16, but regression head defaults to CPU float32)
@@ -426,18 +502,42 @@ trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Total parameters: {total_params:,}")
 print(f"Trainable parameters: {trainable_params:,}")
 
+
 # %%
 # =============================================================================
 # CREATE DATASETS AND DATALOADERS
 # =============================================================================
 
-train_dataset = TextPriceDataset(
-    texts=df_train["prompt"].tolist(),
-    prices=y_train,
-    tokenizer=tokenizer,
-    max_length=CONFIG.max_seq_length,
-)
 
+def create_train_loader(epoch: int) -> DataLoader:
+    """Create train loader for a specific epoch, cycling through datasets.
+
+    Datasets are shuffled before cycling to ensure different order each time.
+    """
+    # Shuffle dataset order for variety
+    import random
+    indices = list(range(len(train_datasets)))
+    random.Random(CONFIG.seed + epoch).shuffle(indices)
+
+    # Select dataset for this epoch (cycle through shuffled order)
+    dataset_idx = indices[epoch % len(train_datasets)]
+    df_train = train_datasets[dataset_idx]
+    y_train = y_train_all[dataset_idx]
+
+    dataset_name = CONFIG.dataset_names[dataset_idx]
+    print(f"  Using dataset [{dataset_idx+1}]: {dataset_name.split('/')[-1]}")
+
+    train_dataset = TextPriceDataset(
+        texts=df_train["prompt"].tolist(),
+        prices=y_train,
+        tokenizer=tokenizer,
+        max_length=CONFIG.max_seq_length,
+    )
+
+    return DataLoader(train_dataset, batch_size=CONFIG.batch_size, shuffle=True)
+
+
+# Val and test loaders are fixed (always from first dataset)
 val_dataset = TextPriceDataset(
     texts=df_val["prompt"].tolist(),
     prices=y_val,
@@ -452,13 +552,13 @@ test_dataset = TextPriceDataset(
     max_length=CONFIG.max_seq_length,
 )
 
-train_loader = DataLoader(train_dataset, batch_size=CONFIG.batch_size, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=CONFIG.batch_size, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=CONFIG.batch_size, shuffle=False)
 
-print(f"Train batches: {len(train_loader):,}")
 print(f"Val batches: {len(val_loader):,}")
 print(f"Test batches: {len(test_loader):,}")
+print(f"\nTrain loaders will cycle through {len(CONFIG.dataset_names)} dataset(s)")
+
 
 # %%
 # =============================================================================
@@ -500,9 +600,12 @@ warmup_optimizer = torch.optim.AdamW(
     weight_decay=CONFIG.weight_decay,
 )
 
-warmup_total_steps = (
-    len(train_loader) * CONFIG.warmup_epochs // CONFIG.gradient_accumulation_steps
-)
+# Calculate steps per epoch (use first dataset as reference)
+temp_loader = create_train_loader(0)
+steps_per_epoch = len(temp_loader) // CONFIG.gradient_accumulation_steps
+del temp_loader
+
+warmup_total_steps = steps_per_epoch * CONFIG.warmup_epochs
 
 warmup_scheduler = torch.optim.lr_scheduler.OneCycleLR(
     warmup_optimizer,
@@ -521,13 +624,12 @@ print("\n" + "-" * 40)
 print("PHASE 2 CONFIG: Joint training (LoRA + regression head)")
 print("-" * 40)
 
-joint_total_steps = (
-    len(train_loader) * CONFIG.epochs // CONFIG.gradient_accumulation_steps
-)
+joint_total_steps = steps_per_epoch * CONFIG.epochs
 
 print(f"Joint epochs: {CONFIG.epochs}")
 print(f"Joint learning rate: {CONFIG.learning_rate:.2e}")
 print(f"Joint total steps: {joint_total_steps:,}")
+
 
 # %%
 # =============================================================================
@@ -549,9 +651,14 @@ if CONFIG.log_to_wandb:
             "learning_rate": CONFIG.learning_rate,
             "warmup_learning_rate": CONFIG.warmup_learning_rate,
             "warmup_epochs": CONFIG.warmup_epochs,
+            "warmup_patience": CONFIG.warmup_patience,
             "joint_epochs": CONFIG.epochs,
+            "cooldown_epochs": CONFIG.cooldown_epochs,
+            "cooldown_learning_rate": CONFIG.cooldown_learning_rate,
+            "cooldown_patience": CONFIG.cooldown_patience,
         },
     )
+
 
 # %%
 # =============================================================================
@@ -571,9 +678,14 @@ print("\n" + "=" * 80)
 print("PHASE 1: WARMUP - Training regression head only")
 print("=" * 80 + "\n")
 
+warmup_no_improve_count = 0
+
 for epoch in range(CONFIG.warmup_epochs):
     print(f"\nWarmup Epoch {epoch + 1}/{CONFIG.warmup_epochs}")
     print("-" * 40)
+
+    # Create train loader for this epoch (cycles through datasets)
+    train_loader = create_train_loader(epoch)
 
     # Train (LoRA is frozen, only regression head learns)
     train_loss, global_step = train_one_epoch(
@@ -610,7 +722,18 @@ for epoch in range(CONFIG.warmup_epochs):
     # Track best model
     if val_metrics["mae"] < best_val_mae:
         best_val_mae = val_metrics["mae"]
+        warmup_no_improve_count = 0
         print(f"New best Val MAE: ${best_val_mae:.2f}")
+    else:
+        warmup_no_improve_count += 1
+
+    # Check early stopping
+    should_stop, reason = check_early_stopping(
+        val_mae=val_metrics["mae"],
+        best_val_mae=best_val_mae,
+        no_improve_count=warmup_no_improve_count,
+        patience=CONFIG.warmup_patience,
+    )
 
     # Save checkpoint after each warmup epoch
     checkpoint_dir = f"./{run_name}-warmup-epoch-{epoch + 1}"
@@ -632,9 +755,16 @@ for epoch in range(CONFIG.warmup_epochs):
         f"Warmup checkpoint saved: epoch {epoch + 1}, Val MAE: ${val_metrics['mae']:.2f}"
     )
 
+    if should_stop:
+        print(f"\n⚠️  Early stopping in warmup: {reason}")
+        break
+
 print("\n" + "=" * 80)
 print(f"WARMUP COMPLETE - Best Val MAE: ${best_val_mae:.2f}")
 print("=" * 80)
+
+# Check for early stopping in warmup
+warmup_epochs_completed = epoch + 1
 
 # =============================================================================
 # PHASE 2: JOINT TRAINING - Train both LoRA and regression head
@@ -669,6 +799,9 @@ global_step = 0
 for epoch in range(CONFIG.epochs):
     print(f"\nJoint Epoch {epoch + 1}/{CONFIG.epochs}")
     print("-" * 40)
+
+    # Create train loader for this epoch (continues cycling from warmup)
+    train_loader = create_train_loader(warmup_epochs_completed + epoch)
 
     # Train (both LoRA and regression head)
     train_loss, global_step = train_one_epoch(
@@ -731,9 +864,128 @@ for epoch in range(CONFIG.epochs):
 
 print("\n" + "=" * 80)
 print("JOINT TRAINING COMPLETE")
-print(f"Total epochs: {CONFIG.warmup_epochs} warmup + {CONFIG.epochs} joint")
-print(f"Best Val MAE: ${best_val_mae:.2f}")
+print(f"Best Val MAE after joint training: ${best_val_mae:.2f}")
 print("=" * 80)
+
+# Track joint training results
+joint_epochs_completed = epoch + 1
+best_joint_mae = best_val_mae
+
+# =============================================================================
+# PHASE 3: COOLDOWN - Fine-tune regression head with frozen LoRA
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("PHASE 3: COOLDOWN - Fine-tuning regression head only")
+print("=" * 80 + "\n")
+
+# Freeze LoRA adapters (lock them at optimal state from Phase 2)
+freeze_lora_adapters(model)
+print(f"Trainable parameters (cooldown): {count_trainable_params(model):,}")
+
+# Create optimizer for cooldown (regression head only, lower LR)
+cooldown_optimizer = torch.optim.AdamW(
+    model.regression_head.parameters(),
+    lr=CONFIG.cooldown_learning_rate,
+    weight_decay=CONFIG.weight_decay,
+)
+
+cooldown_total_steps = steps_per_epoch * CONFIG.cooldown_epochs
+
+# Use CosineAnnealingLR for smooth decay
+cooldown_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    cooldown_optimizer,
+    T_max=cooldown_total_steps,
+)
+
+print(f"Cooldown epochs: {CONFIG.cooldown_epochs}")
+print(f"Cooldown learning rate: {CONFIG.cooldown_learning_rate:.2e}")
+print(f"Cooldown total steps: {cooldown_total_steps:,}\n")
+
+best_cooldown_mae = best_val_mae  # Start from best joint training result
+no_improve_count = 0
+
+for epoch in range(CONFIG.cooldown_epochs):
+    print(f"\nCooldown Epoch {epoch + 1}/{CONFIG.cooldown_epochs}")
+    print("-" * 40)
+
+    # Create train loader for this epoch (continues cycling)
+    train_loader = create_train_loader(warmup_epochs_completed + joint_epochs_completed + epoch)
+
+    # Train (only regression head)
+    train_loss, global_step = train_one_epoch(
+        model=model,
+        train_loader=train_loader,
+        optimizer=cooldown_optimizer,
+        scheduler=cooldown_scheduler,
+        criterion=criterion,
+        device=device,
+        grad_clip=CONFIG.max_grad_norm,
+        gradient_accumulation_steps=CONFIG.gradient_accumulation_steps,
+        epoch=epoch,
+        global_step=global_step,
+        log_steps=CONFIG.log_steps,
+    )
+
+    # Evaluate
+    val_metrics = evaluate(model, val_loader, criterion, device, convert_back_fn)
+
+    print(f"Train Loss: {train_loss:.4f}")
+    print(f"Val Loss: {val_metrics['loss']:.4f} | Val MAE: ${val_metrics['mae']:.2f}")
+
+    if CONFIG.log_to_wandb:
+        wandb.log({
+            "phase": "cooldown",
+            "epoch": warmup_epochs_completed + joint_epochs_completed + epoch + 1,
+            "train/epoch_loss": train_loss,
+            "val/loss": val_metrics["loss"],
+            "val/mae": val_metrics["mae"],
+            "train/lr": cooldown_scheduler.get_last_lr()[0],
+        })
+
+    # Track best model
+    if val_metrics["mae"] < best_cooldown_mae:
+        best_cooldown_mae = val_metrics["mae"]
+        no_improve_count = 0
+        print(f"✓ New best Val MAE: ${best_cooldown_mae:.2f}")
+
+        # Save best cooldown checkpoint
+        checkpoint_dir = f"./{run_name}-cooldown-best"
+        torch.save({
+            "regression_head_state_dict": model.regression_head.state_dict(),
+            "epoch": epoch + 1,
+            "phase": "cooldown",
+            "val_mae": val_metrics["mae"],
+            "val_loss": val_metrics["loss"],
+            "train_loss": train_loss,
+            "model_class": "ResidualNet",
+        }, f"{checkpoint_dir}-regression-head.pth")
+    else:
+        no_improve_count += 1
+
+    # Check early stopping
+    should_stop, reason = check_early_stopping(
+        val_mae=val_metrics["mae"],
+        best_val_mae=best_cooldown_mae,
+        no_improve_count=no_improve_count,
+        patience=CONFIG.cooldown_patience,
+    )
+
+    if should_stop:
+        print(f"\n⚠️  Early stopping in cooldown: {reason}")
+        break
+
+cooldown_epochs_completed = epoch + 1
+
+print("\n" + "=" * 80)
+print("COOLDOWN COMPLETE")
+print(f"Best Cooldown MAE: ${best_cooldown_mae:.2f}")
+print(f"Improvement over joint: ${best_joint_mae - best_cooldown_mae:.2f}")
+print("=" * 80)
+
+# Update best_val_mae for final evaluation
+best_val_mae = best_cooldown_mae
+
 
 # %%
 # =============================================================================
@@ -757,6 +1009,7 @@ if CONFIG.log_to_wandb:
         }
     )
     wandb.finish()
+
 
 # %%
 # =============================================================================
@@ -788,6 +1041,7 @@ regression_head_checkpoint = {
 }
 torch.save(regression_head_checkpoint, local_head_path)
 print(f"Regression head saved to {local_head_path}")
+
 
 # %%
 # =============================================================================

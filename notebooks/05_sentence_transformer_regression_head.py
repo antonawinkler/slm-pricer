@@ -29,6 +29,7 @@ from torch.utils.data import Dataset as TorchDataset
 from tqdm import tqdm
 
 from slm_pricer.models import ResidualNet
+from slm_pricer.training import check_early_stopping
 from slm_pricer.utils import convert_back_y, transformed_prices
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,7 +42,13 @@ class Config:
     """Configuration for embedding-based price prediction."""
 
     # Data configuration
-    dataset_name: str = "ed-donner/items_prompts_full"
+    # Multiple dataset variations - val/test from first, train cycles through all
+    dataset_names: tuple[str, ...] = (
+        "ed-donner/items_prompts_full",
+        # Add more dataset variations here
+        # "ed-donner/items_prompts_full_v2",
+        # "ed-donner/items_prompts_full_v3",
+    )
     train_frac_pct: int = 50
 
     # Model configuration
@@ -89,9 +96,11 @@ except ImportError:
 
 
 # %%
-def load_data(split: str = "train", percent: int = 100) -> Dataset:
+def load_data(split: str = "train", percent: int = 100, dataset_name: str | None = None) -> Dataset:
     """Load dataset split from HuggingFace."""
-    dataset = load_dataset(CONFIG.dataset_name, split=f"{split}[:{percent}%]")
+    if dataset_name is None:
+        dataset_name = CONFIG.dataset_names[0]
+    dataset = load_dataset(dataset_name, split=f"{split}[:{percent}%]")
     assert isinstance(dataset, Dataset)
     return dataset
 
@@ -166,7 +175,6 @@ def evaluate_comprehensive(
 # %%
 def training_loop(
     model: nn.Module,
-    train_loader: DataLoader,
     val_loader: DataLoader,
     test_loader: DataLoader,
     criterion: nn.Module,
@@ -193,6 +201,9 @@ def training_loop(
     epoch_pbar = tqdm(range(CONFIG.epochs), desc="Training", unit="epoch", position=0)
 
     for epoch in epoch_pbar:
+        # Create train loader for this epoch (cycles through datasets)
+        train_loader = create_train_loader(epoch)
+
         model.train()
         running_loss = 0.0
 
@@ -250,11 +261,18 @@ def training_loop(
             print(f"  ✓ New best MAE: ${best_val_mae:.2f}")
         else:
             no_improve_count += 1
-            if no_improve_count >= CONFIG.patience:
-                print(
-                    f"\n⚠️  Early stopping! No improvement for {CONFIG.patience} epochs."
-                )
-                break
+
+        # Check early stopping
+        should_stop, reason = check_early_stopping(
+            val_mae=val_metrics["mae"],
+            best_val_mae=best_val_mae,
+            no_improve_count=no_improve_count,
+            patience=CONFIG.patience,
+        )
+
+        if should_stop:
+            print(f"\n⚠️  Early stopping: {reason}")
+            break
 
     print("\n" + "=" * 80)
     print("FINAL TEST EVALUATION")
@@ -274,14 +292,21 @@ def training_loop(
 
 
 # %%
-print("Loading datasets...")
-ds_train = load_data(split="train", percent=CONFIG.train_frac_pct)
+# Load all training dataset variations
+print(f"Loading {len(CONFIG.dataset_names)} dataset variations...")
+train_datasets = []
+for i, dataset_name in enumerate(CONFIG.dataset_names):
+    ds_train = load_data(split="train", percent=CONFIG.train_frac_pct, dataset_name=dataset_name)
+    train_datasets.append(ds_train)
+    print(f"  [{i+1}] {dataset_name}: {len(ds_train):,} samples")
+
+# Val and test always from the first dataset
+print(f"\nLoading val/test from: {CONFIG.dataset_names[0]}")
 ds_test = load_data(split="test", percent=100)
 ds_val = load_data(split="val", percent=100)
 
-print(f"Train set: {len(ds_train):,} samples")
-print(f"Test set: {len(ds_test):,} samples")
 print(f"Validation set: {len(ds_val):,} samples")
+print(f"Test set: {len(ds_test):,} samples")
 
 
 # %%
@@ -292,28 +317,32 @@ def clean_prompt(text: str) -> str:
     )
 
 
-def get_embedding_path(split: str) -> pathlib.Path:
-    """Get path for cached embeddings for a given split."""
-    return CONFIG.embeddings_dir / f"{split}.npy"
+def get_embedding_path(split: str, dataset_idx: int = 0) -> pathlib.Path:
+    """Get path for cached embeddings for a given split and dataset index."""
+    if split in ("test", "val"):
+        return CONFIG.embeddings_dir / f"{split}.npy"
+    return CONFIG.embeddings_dir / f"{split}_{dataset_idx}.npy"
 
 
-def load_or_create_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_or_create_embeddings() -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """Load embeddings from cache or generate them if they don't exist.
 
     Returns:
-        Tuple of (X_train, X_test, X_val) embeddings
+        Tuple of (X_train_all, X_test, X_val) where X_train_all is list of train embeddings
 
     Embeddings are automatically cached to disk for reuse. The cache key is based
-    on the model name, so switching models will regenerate embeddings.
+    on the model name and dataset index.
     """
-    train_path = get_embedding_path("train")
+    # Check if embeddings need to be generated
     test_path = get_embedding_path("test")
     val_path = get_embedding_path("val")
+    train_paths = [get_embedding_path("train", i) for i in range(len(train_datasets))]
 
-    # Check if all embedding files exist
-    if train_path.exists() and test_path.exists() and val_path.exists():
+    all_exist = test_path.exists() and val_path.exists() and all(p.exists() for p in train_paths)
+
+    if all_exist:
         print(f"Loading cached embeddings from {CONFIG.embeddings_dir}")
-        X_train = np.load(train_path)
+        X_train_all = [np.load(p) for p in train_paths]
         X_test = np.load(test_path)
         X_val = np.load(val_path)
     else:
@@ -344,14 +373,21 @@ def load_or_create_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         )
         embedder.tokenizer.pad_token = embedder.tokenizer.eos_token
 
-        # Generate embeddings for each split
-        X_train = embedder.encode(
-            [clean_prompt(p) for p in ds_train["prompt"]],
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            batch_size=CONFIG.embedding_batch_size,
-        )
+        # Generate embeddings for all training datasets
+        X_train_all = []
+        for i, ds_train in enumerate(train_datasets):
+            print(f"\nGenerating embeddings for train dataset {i+1}/{len(train_datasets)}...")
+            X_train = embedder.encode(
+                [clean_prompt(p) for p in ds_train["prompt"]],
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                batch_size=CONFIG.embedding_batch_size,
+            )
+            X_train_all.append(X_train)
+            np.save(train_paths[i], X_train)
 
+        # Generate embeddings for test/val (only once, from first dataset)
+        print("\nGenerating embeddings for test...")
         X_test = embedder.encode(
             [clean_prompt(p) for p in ds_test["prompt"]],
             show_progress_bar=True,
@@ -359,6 +395,7 @@ def load_or_create_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             batch_size=CONFIG.embedding_batch_size,
         )
 
+        print("Generating embeddings for val...")
         X_val = embedder.encode(
             [clean_prompt(p) for p in ds_val["prompt"]],
             show_progress_bar=True,
@@ -367,30 +404,30 @@ def load_or_create_embeddings() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         )
 
         # Save to cache
-        print(f"Saving embeddings to {CONFIG.embeddings_dir}")
-        np.save(train_path, X_train)
+        print(f"\nSaving embeddings to {CONFIG.embeddings_dir}")
         np.save(test_path, X_test)
         np.save(val_path, X_val)
 
-    # Truncate train embeddings to match dataset size
-    X_train = X_train[: len(ds_train)]
-
     print("\nEmbeddings shape:")
-    print(f"  X_train: {X_train.shape}")
+    for i, X_train in enumerate(X_train_all):
+        print(f"  X_train[{i}]: {X_train.shape}")
     print(f"  X_test: {X_test.shape}")
     print(f"  X_val: {X_val.shape}")
 
-    return X_train, X_test, X_val
+    return X_train_all, X_test, X_val
 
 
 # %%
-X_train, X_test, X_val = load_or_create_embeddings()
+X_train_all, X_test, X_val = load_or_create_embeddings()
 
 
 # %%
-y_train = transformed_prices(
-    np.array(ds_train["completion"], dtype="float32"), CONFIG.y_transform
-)
+# Transform prices for all training datasets
+y_train_all = [
+    transformed_prices(np.array(ds["completion"], dtype="float32"), CONFIG.y_transform)
+    for ds in train_datasets
+]
+
 y_test = transformed_prices(
     np.array(ds_test["completion"], dtype="float32"), CONFIG.y_transform
 )
@@ -399,7 +436,8 @@ y_val = transformed_prices(
 )
 
 print("Targets shape:")
-print(f"  y_train: {y_train.shape}")
+for i, y_train in enumerate(y_train_all):
+    print(f"  y_train[{i}]: {y_train.shape}")
 print(f"  y_test: {y_test.shape}")
 print(f"  y_val: {y_val.shape}")
 
@@ -412,15 +450,59 @@ print(f"Model initialized with {total_params:,} parameters")
 
 
 # %%
-train_loader = DataLoader(
-    PriceDataset(X_train, y_train), batch_size=CONFIG.batch_size, shuffle=True
-)
+# Optional: Load pre-trained regression head from HuggingFace Hub
+# Uncomment to use a pre-trained model instead of training from scratch
+# from slm_pricer.training import load_regression_head_from_hub
+#
+# repo_id = "antonawinkler/slm-pricer-llama-3.2-3b-embedding02-regressor-20260125"
+# model, metadata = load_regression_head_from_hub(repo_id, device=device)
+#
+# print(f"Loaded pre-trained model from {repo_id}")
+# print(f"Pre-trained Val MAE: ${metadata['metrics'].get('val_mae', 'N/A')}")
+# print(f"Pre-trained Test MAE: ${metadata['metrics'].get('test_mae', 'N/A')}")
+# print(f"Training config: {metadata['config']}")
+
+
+# %%
+def create_train_loader(epoch: int) -> DataLoader:
+    """Create train loader for a specific epoch, cycling through datasets.
+
+    Datasets are shuffled before cycling to ensure different order each time.
+    """
+    # Shuffle dataset order for variety
+    import random
+    indices = list(range(len(X_train_all)))
+    random.Random(CONFIG.seed + epoch).shuffle(indices)
+
+    # Select dataset for this epoch (cycle through shuffled order)
+    dataset_idx = indices[epoch % len(X_train_all)]
+    X_train = X_train_all[dataset_idx]
+    y_train = y_train_all[dataset_idx]
+
+    dataset_name = CONFIG.dataset_names[dataset_idx]
+    print(f"  Using dataset [{dataset_idx+1}]: {dataset_name.split('/')[-1]}")
+
+    return DataLoader(
+        PriceDataset(X_train, y_train), batch_size=CONFIG.batch_size, shuffle=True
+    )
+
+
+# Val and test loaders are fixed (always from first dataset)
 val_loader = DataLoader(
     PriceDataset(X_val, y_val), batch_size=CONFIG.batch_size, shuffle=False
 )
 test_loader = DataLoader(
     PriceDataset(X_test, y_test), batch_size=CONFIG.batch_size, shuffle=False
 )
+
+print(f"Val batches: {len(val_loader):,}")
+print(f"Test batches: {len(test_loader):,}")
+print(f"\nTrain loaders will cycle through {len(CONFIG.dataset_names)} dataset(s)")
+
+# Calculate steps per epoch for scheduler (use first dataset as reference)
+temp_loader = create_train_loader(0)
+steps_per_epoch = len(temp_loader)
+del temp_loader
 
 criterion = nn.MSELoss()
 optimizer = optim.AdamW(
@@ -430,7 +512,7 @@ scheduler = optim.lr_scheduler.OneCycleLR(
     optimizer,
     max_lr=CONFIG.learning_rate,
     epochs=CONFIG.epochs,
-    steps_per_epoch=len(train_loader),
+    steps_per_epoch=steps_per_epoch,
     pct_start=0.1,
     anneal_strategy="cos",
 )
@@ -438,5 +520,58 @@ scheduler = optim.lr_scheduler.OneCycleLR(
 
 # %%
 training_loop(
-    model, train_loader, val_loader, test_loader, criterion, optimizer, scheduler
+    model, val_loader, test_loader, criterion, optimizer, scheduler
 )
+
+
+# %%
+# Upload best model to HuggingFace Hub
+from datetime import datetime
+
+from slm_pricer.training import save_regression_head_to_hub
+
+# Load the best model checkpoint
+checkpoint = torch.load(
+    os.path.join(CONFIG.embeddings_base_path, "best_model.pth"), weights_only=False
+)
+model.load_state_dict(checkpoint["model_state_dict"])
+
+# Generate model name with configuration and timestamp
+timestamp = datetime.now().strftime("%Y%m%d")
+base_model_name = CONFIG.model_name.split("/")[-1]
+repo_id = f"antonawinkler/slm-pricer-{base_model_name}-regressor-{timestamp}"
+
+print(f"Uploading model to HuggingFace Hub as: {repo_id}")
+
+# Gather metrics from checkpoint
+metrics = {
+    "val_mae": checkpoint.get("mae", 0.0),
+    "train_frac_pct": CONFIG.train_frac_pct,
+}
+
+# Gather configuration
+config = {
+    "dataset_name": CONFIG.dataset_name,
+    "model_name": CONFIG.model_name,
+    "y_transform": CONFIG.y_transform,
+    "batch_size": CONFIG.batch_size,
+    "learning_rate": CONFIG.learning_rate,
+    "weight_decay": CONFIG.weight_decay,
+    "dropout": CONFIG.dropout,
+    "epochs": CONFIG.epochs,
+    "patience": CONFIG.patience,
+    "grad_clip": CONFIG.grad_clip,
+    "input_dim": X_train.shape[1],
+}
+
+# Save to HuggingFace Hub with metadata
+save_regression_head_to_hub(
+    model=model,
+    repo_id=repo_id,
+    metrics=metrics,
+    config=config,
+    commit_message=f"Regression head trained on {CONFIG.dataset_name}",
+    private=False,
+)
+
+print(f"✓ Model uploaded successfully to {repo_id}")
