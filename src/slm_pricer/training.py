@@ -228,6 +228,25 @@ def check_early_stopping(
     return False, ""
 
 
+def _get_model_registry() -> dict[str, type[nn.Module]]:
+    """Return a mapping of model class names to their classes."""
+    from slm_pricer.models import (
+        MLP,
+        PriceNetPostAct,
+        PriceNetPreAct,
+        ResidualNet,
+        ResNetSimpleNN,
+    )
+
+    return {
+        "ResidualNet": ResidualNet,
+        "MLP": MLP,
+        "PriceNetPostAct": PriceNetPostAct,
+        "PriceNetPreAct": PriceNetPreAct,
+        "ResNetSimpleNN": ResNetSimpleNN,
+    }
+
+
 def load_regression_head_from_hub(
     repo_id: str,
     filename: str = "best_model.pth",
@@ -235,16 +254,12 @@ def load_regression_head_from_hub(
 ) -> tuple[nn.Module, dict[str, Any]]:
     """Load a pre-trained regression head from HuggingFace Hub.
 
-    Args:
-        repo_id: HuggingFace repository ID (e.g., "antonawinkler/model-name")
-        filename: Name of the checkpoint file in the repo
-        device: Device to load the model on
+    Supports all model classes in slm_pricer.models. Constructor kwargs
+    are read from the checkpoint's "model_kwargs" field. Falls back to
+    extracting input_dim/hidden_dim from config for old ResidualNet checkpoints.
 
     Returns:
-        (model, metadata) where metadata contains:
-            - config: Training configuration
-            - metrics: Performance metrics (val_mae, test_mae, etc.)
-            - epoch: Training epoch
+        (model, metadata) where metadata contains config, metrics, epoch, phase.
 
     Example:
         >>> model, metadata = load_regression_head_from_hub(
@@ -252,28 +267,34 @@ def load_regression_head_from_hub(
         ... )
         >>> print(f"Pre-trained Val MAE: ${metadata['metrics']['val_mae']:.2f}")
     """
-    from slm_pricer.models import ResidualNet
+    registry = _get_model_registry()
 
-    # Download checkpoint from HuggingFace Hub
     checkpoint_path = hf_hub_download(repo_id=repo_id, filename=filename)
-
-    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # Extract model class and kwargs
     model_class_name = checkpoint.get("model_class", "ResidualNet")
-    if model_class_name != "ResidualNet":
-        raise ValueError(f"Unknown model class: {model_class_name}")
+    if model_class_name not in registry:
+        raise ValueError(
+            f"Unknown model class: {model_class_name}. "
+            f"Available: {list(registry.keys())}"
+        )
 
-    # Get input_dim from checkpoint if available
-    model_kwargs = {}
-    if "config" in checkpoint and "input_dim" in checkpoint["config"]:
-        model_kwargs["input_dim"] = checkpoint["config"]["input_dim"]
-    if "config" in checkpoint and "hidden_dim" in checkpoint["config"]:
-        model_kwargs["hidden_dim"] = checkpoint["config"]["hidden_dim"]
+    model_cls = registry[model_class_name]
 
-    # Create model and load state dict
-    model = ResidualNet(**model_kwargs)
+    # New format: model_kwargs stored explicitly in checkpoint
+    if "model_kwargs" in checkpoint:
+        model_kwargs = checkpoint["model_kwargs"]
+    else:
+        # Legacy format: extract from config
+        model_kwargs = {}
+        config = checkpoint.get("config", {})
+        if "input_dim" in config:
+            model_kwargs["input_dim"] = config["input_dim"]
+        if "hidden_dim" in config:
+            model_kwargs["hidden_dim"] = config["hidden_dim"]
+
+    model = model_cls(**model_kwargs)
+
     if "regression_head_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["regression_head_state_dict"])
     elif "model_state_dict" in checkpoint:
@@ -283,7 +304,6 @@ def load_regression_head_from_hub(
 
     model = model.to(device)
 
-    # Extract metadata
     metadata = {
         "config": checkpoint.get("training_config", checkpoint.get("config", {})),
         "metrics": checkpoint.get("metrics", {}),
@@ -291,7 +311,6 @@ def load_regression_head_from_hub(
         "phase": checkpoint.get("phase", None),
     }
 
-    # Add individual metrics to metadata for backward compatibility
     for key in ["val_mae", "val_loss", "test_mae", "test_loss"]:
         if key in checkpoint:
             metadata["metrics"][key] = checkpoint[key]
@@ -304,6 +323,7 @@ def save_regression_head_to_hub(
     repo_id: str,
     metrics: dict[str, float],
     config: dict[str, Any],
+    model_kwargs: dict[str, Any] | None = None,
     commit_message: str = "Upload regression head",
     private: bool = False,
     filename: str = "best_model.pth",
@@ -315,6 +335,9 @@ def save_regression_head_to_hub(
         repo_id: HuggingFace repository ID (e.g., "antonawinkler/model-name")
         metrics: Performance metrics (val_mae, test_mae, etc.)
         config: Training configuration
+        model_kwargs: Constructor kwargs needed to reconstruct the model.
+            If None, load_regression_head_from_hub will fall back to
+            extracting input_dim/hidden_dim from config (legacy behavior).
         commit_message: Git commit message
         private: Whether to make the repository private
         filename: Name for the checkpoint file
@@ -325,17 +348,20 @@ def save_regression_head_to_hub(
         ...     repo_id="antonawinkler/slm-pricer-regressor",
         ...     metrics={"val_mae": 125.50, "test_mae": 130.20},
         ...     config={"learning_rate": 1e-4, "batch_size": 2048},
+        ...     model_kwargs={"d_in": 3072, "d": 256, "n_layers": 1, "dropout": 0.1, "d_out": 1},
         ... )
     """
     import tempfile
 
-    # Create checkpoint with metadata
-    checkpoint = {
+    checkpoint: dict[str, Any] = {
         "regression_head_state_dict": model.state_dict(),
-        "model_class": "ResidualNet",
+        "model_class": type(model).__name__,
         "metrics": metrics,
         "training_config": config,
     }
+
+    if model_kwargs is not None:
+        checkpoint["model_kwargs"] = model_kwargs
 
     # Save checkpoint locally
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pth") as tmp_file:
